@@ -129,6 +129,7 @@ class MaterialRow(ft.Container):
         super().__init__()
         self.remove_callback = remove_callback
         self.padding = 5
+        self.height = 60  # Fixed height to prevent layout calculation errors
 
         self.txt_name = ft.TextField(
             value=name,
@@ -162,16 +163,23 @@ class MaterialRow(ft.Container):
             row_controls.append(tf)
 
         # Delete button
-        btn_del = ft.IconButton(
-            icon="delete_outline",
+        # Delete button (Workaround: IconButton is incompatible in this env, using Container+Icon)
+        btn_del = ft.Container(
+            content=ft.Text(
+                "X", color=ft.Colors.RED_400, weight=ft.FontWeight.BOLD, size=20
+            ),
             on_click=lambda e: self.remove_callback(self),
-            icon_color=ft.Colors.RED_400,
             tooltip="Remove Material",
+            width=40,
+            height=40,
+            alignment=ft.Alignment(0, 0),
         )
         row_controls.append(btn_del)
 
         self.content = ft.Row(
-            controls=row_controls, alignment=ft.MainAxisAlignment.START
+            controls=row_controls,
+            alignment=ft.MainAxisAlignment.START,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
     def get_data(self):
@@ -192,13 +200,14 @@ def main(page: ft.Page):
     page.padding = 20
     page.window_width = 1100
     page.window_height = 800
+    page.scroll = ft.ScrollMode.AUTO
 
     # -------------------------------------------------------------------------
     # State & Utils
     # -------------------------------------------------------------------------
 
     material_rows_col = ft.Column(
-        scroll=ft.ScrollMode.ALWAYS
+        scroll=ft.ScrollMode.ALWAYS, expand=True
     )  # Scrollable container for rows
 
     def add_material_row(e=None, name="", defaults=None):

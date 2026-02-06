@@ -105,7 +105,7 @@ def main(page: ft.Page):
         ),
         # CORRECCIÓN: ft.Border (Mayúscula) y quitamos bgcolor para evitar cuadro gris
         padding=15,
-        border=ft.Border.all(1, ft.Colors.WHITE24),
+        border=ft.Border.all(1, ft.Colors.TRANSPARENT),
         border_radius=10,
     )
 
