@@ -148,6 +148,17 @@ class MaterialRow(ft.Container):
 
         row_controls = [self.txt_name]
 
+        # Total Percentage Indicator
+        self.txt_total = ft.Text(
+            value="Sum: 0.0%",
+            weight=ft.FontWeight.BOLD,
+            color=ft.Colors.GREEN_400,
+            size=12,
+        )
+
+        def on_change_chem(e):
+            self.update_total()
+
         for oxide in oxides:
             val = str(chem_defaults.get(oxide, 0.0))
             tf = ft.TextField(
@@ -158,11 +169,21 @@ class MaterialRow(ft.Container):
                 text_size=12,
                 content_padding=5,
                 keyboard_type=ft.KeyboardType.NUMBER,
+                on_change=on_change_chem,
             )
             self.inputs[oxide] = tf
             row_controls.append(tf)
 
-        # Delete button
+        # Add Total Indicator to row
+        row_controls.append(
+            ft.Container(
+                content=self.txt_total,
+                alignment=ft.Alignment(0, 0),
+                padding=5,
+                width=80,
+            )
+        )
+
         # Delete button (Workaround: IconButton is incompatible in this env, using Container+Icon)
         btn_del = ft.Container(
             content=ft.Text(
@@ -182,13 +203,50 @@ class MaterialRow(ft.Container):
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
+        # Initialize total
+        self.update_total()
+
+    def update_total(self):
+        try:
+            total = 0.0
+            for v in self.inputs.values():
+                val = float(v.value) if v.value else 0.0
+                total += val
+
+            self.txt_total.value = f"Sum: {total:.1f}%"
+
+            if total > 100.001:  # Slight float tolerance
+                self.txt_total.color = ft.Colors.RED_400
+                self.txt_total.weight = ft.FontWeight.BOLD
+                self.valid_total = False
+            else:
+                self.txt_total.color = ft.Colors.GREEN_400
+                self.txt_total.weight = ft.FontWeight.NORMAL
+                self.valid_total = True
+
+            try:
+                if self.txt_total.page:
+                    self.txt_total.update()
+            except Exception:
+                pass  # Control not yet on page
+        except ValueError:
+            pass
+
     def get_data(self):
         """Returns valid dict or None if invalid."""
         try:
             chem = {}
+            total = 0.0
             for k, v in self.inputs.items():
                 val = float(v.value) if v.value else 0.0
+                if val < 0:
+                    return None  # Negative check
                 chem[k] = val
+                total += val
+
+            if total > 100.001:
+                return None  # Restrict > 100%
+
             return {"name": self.txt_name.value, "chem": chem}
         except ValueError:
             return None
