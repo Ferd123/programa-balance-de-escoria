@@ -1,6 +1,51 @@
 import flet as ft
 import numpy as np
+import pandas as pd
 from scipy.optimize import minimize
+from scipy.interpolate import LinearNDInterpolator
+
+# -----------------------------------------------------------------------------
+# Data Models
+# -----------------------------------------------------------------------------
+
+
+class SlagProperties:
+    def __init__(self, csv_path):
+        self.model_visc = None
+        self.model_liq = None
+        try:
+            df = pd.read_csv(csv_path)
+            # Ensure columns exist
+            required = ["Basicity", "Alumina_Pct", "Viscosity", "Liquid_Fraction"]
+            if not all(col in df.columns for col in required):
+                raise ValueError(f"CSV missing columns: {required}")
+
+            points = df[["Basicity", "Alumina_Pct"]].values
+            self.model_visc = LinearNDInterpolator(points, df["Viscosity"].values)
+            self.model_liq = LinearNDInterpolator(points, df["Liquid_Fraction"].values)
+        except Exception as e:
+            print(f"Error loading slag data: {e}")
+
+    def predict(self, b2, alumina):
+        """
+        Returns (viscosity, liquid_fraction).
+        Returns (nan, nan) if extrapolation fails or model not loaded.
+        """
+        if self.model_visc is None or self.model_liq is None:
+            return 0.0, 0.0
+
+        # LinearNDInterpolator returns an array, we want scalar
+        v = self.model_visc(b2, alumina)
+        l = self.model_liq(b2, alumina)
+
+        # Handle nan (extrapolation)
+        if np.isnan(v):
+            v = 0.0
+        if np.isnan(l):
+            l = 0.0
+
+        return float(v), float(l)
+
 
 # -----------------------------------------------------------------------------
 # Optimization Engine
@@ -501,7 +546,104 @@ def main(page: ft.Page):
                 ft.Text("Final Chemistry:", weight=ft.FontWeight.BOLD),
                 ft.Text(target_summary, color=ft.Colors.CYAN_200),
                 chem_table,
+                ft.Container(height=20),
+                ft.Divider(),
+                ft.Text(
+                    "Slag Properties (Thermo-Calc Data)",
+                    size=16,
+                    weight=ft.FontWeight.BOLD,
+                ),
+                ft.Container(height=10),
             ]
+
+            # --- Slag Properties Prediction ---
+            try:
+                slag_model = SlagProperties("slag_data.csv")
+                b2_calc = res["final_b2"]
+                al2o3_calc = res["final_chem"].get("Al2O3", 0.0)
+
+                visc, liq_frac = slag_model.predict(b2_calc, al2o3_calc)
+
+                # Viscosity Display Logic
+                visc_color = ft.Colors.GREEN_400
+                visc_text = "Fluid"
+                if visc > 5.0:
+                    visc_color = ft.Colors.RED_400
+                    visc_text = "Viscous"
+                elif visc > 3.0:
+                    visc_color = ft.Colors.ORANGE_400
+                    visc_text = "Semi-Fluid"
+
+                visc_control = ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Text("Viscosity", size=12, color=ft.Colors.GREY_400),
+                            ft.Row(
+                                [
+                                    ft.Icon(ft.Icons.WATER_DROP, color=visc_color),
+                                    ft.Text(
+                                        f"{visc:.2f} Poise",
+                                        size=20,
+                                        weight=ft.FontWeight.BOLD,
+                                        color=visc_color,
+                                    ),
+                                    ft.Text(f"({visc_text})", color=visc_color),
+                                ]
+                            ),
+                        ]
+                    ),
+                    padding=10,
+                    border=ft.Border.all(1, ft.Colors.WHITE10),
+                    border_radius=8,
+                )
+
+                # Liquid Fraction Display Logic
+                liq_color = ft.Colors.GREEN_400
+                if liq_frac < 90:
+                    liq_color = (
+                        ft.Colors.RED_400 if liq_frac < 80 else ft.Colors.ORANGE_400
+                    )
+
+                liq_control = ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Row(
+                                [
+                                    ft.Text(
+                                        "Liquid Fraction",
+                                        size=12,
+                                        color=ft.Colors.GREY_400,
+                                    ),
+                                    ft.Text(
+                                        f"{liq_frac:.1f}%",
+                                        weight=ft.FontWeight.BOLD,
+                                        color=liq_color,
+                                    ),
+                                ],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            ),
+                            ft.ProgressBar(
+                                value=liq_frac / 100.0,
+                                color=liq_color,
+                                bgcolor=ft.Colors.GREY_800,
+                                height=10,
+                            ),
+                        ]
+                    ),
+                    padding=10,
+                    border=ft.Border.all(1, ft.Colors.WHITE10),
+                    border_radius=8,
+                    margin=ft.Margin(top=5, bottom=0),
+                )
+
+                results_grid.controls.extend([visc_control, liq_control])
+
+            except Exception as e:
+                results_grid.controls.append(
+                    ft.Text(
+                        f"Property Prediction Error: {str(e)}", color=ft.Colors.RED_400
+                    )
+                )
 
             page.update()
 
