@@ -1,699 +1,510 @@
 import flet as ft
 import numpy as np
 import pandas as pd
+import math
+from dataclasses import dataclass
+from typing import Dict, Sequence, List, Optional
 from scipy.optimize import minimize
 from scipy.interpolate import LinearNDInterpolator
+import matplotlib
+matplotlib.use("Agg") # Backend no interactivo
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
+import io
+import base64
 
-# -----------------------------------------------------------------------------
-# Data Models
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 1. MODELO DE VISCOSIDAD DE URBAIN (Tu código)
+# =============================================================================
 
+A_ALL = np.array([13.2, 30.5, -40.4, 60.8], dtype=float)
+B_MG = np.array([15.9, -54.1, 138.0, -99.8], dtype=float)
+B_CA = np.array([41.5, -117.2, 232.1, -156.4], dtype=float)
+B_MN = np.array([20.0, 26.0, -110.3, 64.3], dtype=float)
+C_MG = np.array([-18.6, 33.0, -112.0, 97.6], dtype=float)
+C_CA = np.array([-45.0, 130.0, -298.6, 213.6], dtype=float)
+C_MN = np.array([-25.6, -56.0, 186.2, -104.6], dtype=float)
 
-class SlagProperties:
+MW: Dict[str, float] = {
+    "SiO2": 60.0843, "Al2O3": 101.961, "CaO": 56.077, "MgO": 40.304,
+    "FeO": 71.844, "Fe2O3": 159.688, "MnO": 70.937, "TiO2": 79.866,
+    "Na2O": 61.979, "K2O": 94.196, "H2O": 18.01528, "P2O5": 141.943,
+    "CaF2": 78.07 # Agregado para manejo de masa, aunque Urbain lo ignora
+}
+
+ORDER = ["SiO2", "Al2O3", "CaO", "MgO", "FeO", "Fe2O3", "MnO", "TiO2", "Na2O", "K2O", "H2O", "P2O5"]
+
+@dataclass(frozen=True)
+class UrbainResult:
+    wt_norm: Dict[str, float]
+    X: Dict[str, float]
+    XG: float; XA: float; XM: float; X_ratio: float; alpha: float
+    B_each: Dict[str, float]; B_mean: float
+    T_C: np.ndarray; T_K: np.ndarray
+    mu_Pa_s: np.ndarray
+
+def normalize_wt_percent(wt: Dict[str, float]) -> Dict[str, float]:
+    # Normaliza ignorando lo que no está en ORDER (ej. CaF2)
+    s = sum(wt.get(ox, 0.0) for ox in ORDER)
+    if s <= 0: return {ox: 0.0 for ox in ORDER} # Retorno seguro
+    return {ox: 100.0 * wt.get(ox, 0.0) / s for ox in ORDER}
+
+def wt_to_mole_fractions(wt_norm: Dict[str, float]) -> Dict[str, float]:
+    n = np.array([wt_norm[ox] / MW[ox] for ox in ORDER], dtype=float)
+    nt = float(n.sum())
+    if nt <= 0: return {ox: 0.0 for ox in ORDER}
+    Xvec = n / nt
+    return {ox: float(Xvec[i]) for i, ox in enumerate(ORDER)}
+
+def calc_B_from_coeff(a, b, c, alpha, XG) -> float:
+    Bi = a + b * alpha + c * (alpha ** 2)
+    B0, B1, B2, B3 = (float(Bi[0]), float(Bi[1]), float(Bi[2]), float(Bi[3]))
+    return B0 + B1 * XG + B2 * (XG ** 2) + B3 * (XG ** 3)
+
+def urbain_modified(wt_in: Dict[str, float], T_C: Sequence[float]) -> Optional[UrbainResult]:
+    try:
+        wt_norm = normalize_wt_percent(wt_in)
+        X = wt_to_mole_fractions(wt_norm)
+        
+        XG = X["SiO2"] + X["P2O5"]
+        XA = X["Al2O3"] + X["Fe2O3"]
+        XM = sum(X[ox] for ox in ["CaO", "MgO", "MnO", "Na2O", "K2O", "FeO", "TiO2"])
+
+        denom = (XA + XM)
+        if denom <= 0: return None
+        
+        X_ratio = XG / (XG + XA + XM)
+        alpha = XM / (XA + XM)
+
+        B_each = {}
+        if wt_in.get("MgO", 0.0) > 0: B_each["B_Mg"] = calc_B_from_coeff(A_ALL, B_MG, C_MG, alpha, XG)
+        if wt_in.get("CaO", 0.0) > 0: B_each["B_Ca"] = calc_B_from_coeff(A_ALL, B_CA, C_CA, alpha, XG)
+        if wt_in.get("MnO", 0.0) > 0: B_each["B_Mn"] = calc_B_from_coeff(A_ALL, B_MN, C_MN, alpha, XG)
+
+        if not B_each: return None
+        B_mean = float(np.mean(list(B_each.values())))
+
+        T_C_arr = np.array(T_C, dtype=float).reshape(-1)
+        T_K_arr = T_C_arr + 273.15
+        
+        A = math.exp(-(0.29 * B_mean + 11.57))
+        mu_Pa_s = A * T_K_arr * np.exp(1000.0 * B_mean / T_K_arr)
+
+        return UrbainResult(wt_norm, X, float(XG), float(XA), float(XM), float(X_ratio), float(alpha), B_each, B_mean, T_C_arr, T_K_arr, mu_Pa_s)
+    except Exception as e:
+        print(f"Urbain Error: {e}")
+        return None
+
+# =============================================================================
+# 2. MODELO DE FASES (CSV INTERPOLATION)
+# =============================================================================
+
+class SlagPhaseModel:
     def __init__(self, csv_path):
-        self.model_visc = None
         self.model_liq = None
+        self.raw_data = None
         try:
+            # Cargar CSV limpio: Alumina, Silica, Liquid Ratio
             df = pd.read_csv(csv_path)
-            # Ensure columns exist
-            required = ["Basicity", "Alumina_Pct", "Viscosity", "Liquid_Fraction"]
-            if not all(col in df.columns for col in required):
-                raise ValueError(f"CSV missing columns: {required}")
+            # Aseguramos nombres correctos
+            df.columns = [c.strip() for c in df.columns]
+            
+            # Mapeo de columnas flexible
+            col_al = next((c for c in df.columns if "Alumina" in c), None)
+            col_si = next((c for c in df.columns if "Silica" in c), None)
+            col_liq = next((c for c in df.columns if "Liquid" in c), None)
 
-            points = df[["Basicity", "Alumina_Pct"]].values
-            self.model_visc = LinearNDInterpolator(points, df["Viscosity"].values)
-            self.model_liq = LinearNDInterpolator(points, df["Liquid_Fraction"].values)
-        except Exception as e:
-            print(f"Error loading slag data: {e}")
-
-    def predict(self, b2, alumina):
-        """
-        Returns (viscosity, liquid_fraction).
-        Returns (nan, nan) if extrapolation fails or model not loaded.
-        """
-        if self.model_visc is None or self.model_liq is None:
-            return 0.0, 0.0
-
-        # LinearNDInterpolator returns an array, we want scalar
-        v = self.model_visc(b2, alumina)
-        l = self.model_liq(b2, alumina)
-
-        # Handle nan (extrapolation)
-        if np.isnan(v):
-            v = 0.0
-        if np.isnan(l):
-            l = 0.0
-
-        return float(v), float(l)
-
-
-# -----------------------------------------------------------------------------
-# Optimization Engine
-# -----------------------------------------------------------------------------
-
-
-def solve_optimization(carry_mass, carry_chem, materials, target_b2, target_mgo):
-    """
-    Solves for the mass of each material to add to meet constraints.
-
-    Args:
-        carry_mass (float): Mass of carry-over slag.
-        carry_chem (dict): Composition of carry-over slag {'Name': %, ...}.
-        materials (list): List of dicts [{'name': '...', 'chem': {...}}, ...].
-        target_b2 (float): Minimum Basicity (CaO/SiO2).
-        target_mgo (float): Minimum %MgO.
-
-    Returns:
-        dict: Result containing 'success', 'message', 'added_masses', 'final_chem', 'final_mass'.
-    """
-
-    # Oxides of interest
-    oxide_list = ["FeO", "CaO", "MgO", "SiO2", "Al2O3", "MnO"]
-
-    # Helper to get mass of a specific oxide from carry-over
-    def get_carry_oxide_mass(oxide):
-        return carry_mass * (carry_chem.get(oxide, 0.0) / 100.0)
-
-    # Initial guesses (add 1kg of each material)
-    n_materials = len(materials)
-    x0 = np.ones(n_materials)
-
-    # bounds: x >= 0
-    bounds = [(0, None) for _ in range(n_materials)]
-
-    # --- Constraints ---
-
-    # 1. Basicity Constraint: CaO / SiO2 >= Target
-    # CaO_total - Target * SiO2_total >= 0
-    def constraint_basicity(x):
-        mass_cao = get_carry_oxide_mass("CaO")
-        mass_sio2 = get_carry_oxide_mass("SiO2")
-
-        for i, mass in enumerate(x):
-            mat_chem = materials[i]["chem"]
-            mass_cao += mass * (mat_chem.get("CaO", 0.0) / 100.0)
-            mass_sio2 += mass * (mat_chem.get("SiO2", 0.0) / 100.0)
-
-        # Avoid division by zero if SiO2 is 0 (unlikely but safe)
-        if mass_sio2 == 0:
-            return mass_cao  # Treat as infinite basicity if SiO2 is 0
-
-        return mass_cao - (target_b2 * mass_sio2)
-
-    # 2. MgO Constraint: %MgO >= Target
-    # MgO_total / Total_Mass >= Target / 100
-    # MgO_total - (Target/100) * Total_Mass >= 0
-    def constraint_mgo(x):
-        total_mass = carry_mass + np.sum(x)
-        mass_mgo = get_carry_oxide_mass("MgO")
-
-        for i, mass in enumerate(x):
-            mat_chem = materials[i]["chem"]
-            mass_mgo += mass * (mat_chem.get("MgO", 0.0) / 100.0)
-
-        return mass_mgo - ((target_mgo / 100.0) * total_mass)
-
-    cons = [
-        {"type": "ineq", "fun": constraint_basicity},
-        {"type": "ineq", "fun": constraint_mgo},
-    ]
-
-    # Objective: Minimize total mass added
-    def objective(x):
-        return np.sum(x)
-
-    # Optimization
-    result = minimize(
-        objective, x0, method="SLSQP", bounds=bounds, constraints=cons, tol=1e-4
-    )
-
-    # --- Result Processing ---
-
-    added_masses = {}
-    final_chem = {}
-
-    total_mass_final = carry_mass + np.sum(result.x)
-
-    # Calculate final composition
-    for oxide in oxide_list:
-        mass_oxide = get_carry_oxide_mass(oxide)
-        for i, mass in enumerate(result.x):
-            mass_oxide += mass * (materials[i]["chem"].get(oxide, 0.0) / 100.0)
-
-        final_chem[oxide] = (
-            (mass_oxide / total_mass_final) * 100.0 if total_mass_final > 0 else 0.0
-        )
-
-    for i, mat in enumerate(materials):
-        added_masses[mat["name"]] = max(
-            0.0, result.x[i]
-        )  # Ensure no slightly neg floats
-
-    # Calculate final Basicity for report
-    final_b2 = final_chem["CaO"] / final_chem["SiO2"] if final_chem["SiO2"] > 0 else 0.0
-
-    return {
-        "success": result.success,
-        "message": result.message,
-        "added_masses": added_masses,
-        "final_mass": total_mass_final,
-        "final_chem": final_chem,
-        "final_b2": final_b2,
-    }
-
-
-# -----------------------------------------------------------------------------
-# GUI Components
-# -----------------------------------------------------------------------------
-
-
-class MaterialRow(ft.Container):
-    """A row in the material list representing one additive."""
-
-    def __init__(self, remove_callback, name="", defaults=None):
-        super().__init__()
-        self.remove_callback = remove_callback
-        self.padding = 5
-        self.height = 60  # Fixed height to prevent layout calculation errors
-
-        self.txt_name = ft.TextField(
-            value=name,
-            label="Name",
-            width=120,
-            height=40,
-            text_size=12,
-            content_padding=5,
-        )
-
-        self.inputs = {}
-        oxides = ["FeO", "CaO", "MgO", "SiO2", "Al2O3", "MnO"]
-
-        # Default composition if provided
-        chem_defaults = defaults if defaults else {}
-
-        row_controls = [self.txt_name]
-
-        # Total Percentage Indicator
-        self.txt_total = ft.Text(
-            value="Sum: 0.0%",
-            weight=ft.FontWeight.BOLD,
-            color=ft.Colors.GREEN_400,
-            size=12,
-        )
-
-        def on_change_chem(e):
-            self.update_total()
-
-        for oxide in oxides:
-            val = str(chem_defaults.get(oxide, 0.0))
-            tf = ft.TextField(
-                value=val,
-                label=oxide,
-                width=70,
-                height=40,
-                text_size=12,
-                content_padding=5,
-                keyboard_type=ft.KeyboardType.NUMBER,
-                on_change=on_change_chem,
-            )
-            self.inputs[oxide] = tf
-            row_controls.append(tf)
-
-        # Add Total Indicator to row
-        row_controls.append(
-            ft.Container(
-                content=self.txt_total,
-                alignment=ft.Alignment(0, 0),
-                padding=5,
-                width=80,
-            )
-        )
-
-        # Delete button (Workaround: IconButton is incompatible in this env, using Container+Icon)
-        btn_del = ft.Container(
-            content=ft.Text(
-                "X", color=ft.Colors.RED_400, weight=ft.FontWeight.BOLD, size=20
-            ),
-            on_click=lambda e: self.remove_callback(self),
-            tooltip="Remove Material",
-            width=40,
-            height=40,
-            alignment=ft.Alignment(0, 0),
-        )
-        row_controls.append(btn_del)
-
-        self.content = ft.Row(
-            controls=row_controls,
-            alignment=ft.MainAxisAlignment.START,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        )
-
-        # Initialize total
-        self.update_total()
-
-    def update_total(self):
-        try:
-            total = 0.0
-            for v in self.inputs.values():
-                val = float(v.value) if v.value else 0.0
-                total += val
-
-            self.txt_total.value = f"Sum: {total:.1f}%"
-
-            if total > 100.001:  # Slight float tolerance
-                self.txt_total.color = ft.Colors.RED_400
-                self.txt_total.weight = ft.FontWeight.BOLD
-                self.valid_total = False
+            if col_al and col_si and col_liq:
+                self.raw_data = df[[col_al, col_si, col_liq]].copy()
+                points = df[[col_al, col_si]].values
+                values = df[col_liq].values
+                self.model_liq = LinearNDInterpolator(points, values)
+                print(" Modelo de Fases Cargado Exitosamente.")
             else:
-                self.txt_total.color = ft.Colors.GREEN_400
-                self.txt_total.weight = ft.FontWeight.NORMAL
-                self.valid_total = True
+                print(" Error: No se encontraron columnas de Alumina/Silica/Liquid en el CSV.")
 
-            try:
-                if self.txt_total.page:
-                    self.txt_total.update()
-            except Exception:
-                pass  # Control not yet on page
-        except ValueError:
-            pass
+        except Exception as e:
+            print(f" Error cargando CSV de fases: {e}")
 
-    def get_data(self):
-        """Returns valid dict or None if invalid."""
-        try:
-            chem = {}
-            total = 0.0
-            for k, v in self.inputs.items():
-                val = float(v.value) if v.value else 0.0
-                if val < 0:
-                    return None  # Negative check
-                chem[k] = val
-                total += val
+    def predict_liquid(self, alumina, silica):
+        if self.model_liq is None: return 0.0
+        val = self.model_liq(alumina, silica)
+        if np.isnan(val): return 0.0
+        return float(val) * 100.0 # Convertir ratio (0-1) a %
 
-            if total > 100.001:
-                return None  # Restrict > 100%
+    def get_contour_data(self):
+        return self.raw_data
 
-            return {"name": self.txt_name.value, "chem": chem}
-        except ValueError:
-            return None
-
+# =============================================================================
+# 3. INTERFAZ GRÁFICA (FLET)
+# =============================================================================
 
 def main(page: ft.Page):
-    page.title = "Steelmaking Slag Optimization"
+    page.title = "Simulador de Escorias Siderúrgicas v2.0"
     page.theme_mode = ft.ThemeMode.DARK
-    page.padding = 20
-    page.window_width = 1100
-    page.window_height = 800
-    page.scroll = ft.ScrollMode.AUTO
+    page.window_width = 1300
+    page.window_height = 900
+    page.padding = 10
 
+    # --- STATE ---
+    phase_model = SlagPhaseModel("liquid_ratio_cleaned.csv")
+    material_rows = []
+
+    # --- TABS SETUP ---
+    tabs = ft.Tabs(selected_index=0, animation_duration=300)
+    
     # -------------------------------------------------------------------------
-    # State & Utils
+    # TAB 1: PROCESO (Desoxidación & Carry-Over)
     # -------------------------------------------------------------------------
+    
+    # Inputs Desoxidación
+    txt_steel_mass = ft.TextField(label="Masa Acero (Ton)", value="100", width=120)
+    txt_O_ppm = ft.TextField(label="Oxígeno Inicial (ppm)", value="450", width=120)
+    txt_Al_add = ft.TextField(label="Al Añadido (kg)", value="30", width=100)
+    txt_FeSi_add = ft.TextField(label="FeSi Añadido (kg)", value="50", width=100) # 75% Si
+    txt_FeMn_add = ft.TextField(label="FeMn Añadido (kg)", value="100", width=100) # 80% Mn
 
-    material_rows_col = ft.Column(
-        scroll=ft.ScrollMode.ALWAYS, expand=True
-    )  # Scrollable container for rows
+    # Inputs Carry-Over
+    txt_carry_mass = ft.TextField(label="Masa Escoria Olla (kg)", value="500", width=120)
+    # Inputs Química Carry-Over
+    oxides = ["FeO", "CaO", "MgO", "SiO2", "Al2O3", "MnO", "CaF2"]
+    carry_defaults = {"FeO":15, "CaO":35, "MgO":8, "SiO2":25, "Al2O3":10, "MnO":7, "CaF2":0}
+    inputs_carry = {ox: ft.TextField(label=f"%{ox}", value=str(carry_defaults.get(ox,0)), width=70, text_size=12) for ox in oxides}
 
-    def add_material_row(e=None, name="", defaults=None):
-        row = MaterialRow(remove_material_row, name, defaults)
-        material_rows_col.controls.append(row)
-        material_rows_col.update()
+    # Inputs Targets
+    txt_target_b2 = ft.TextField(label="Target B2", value="2.0", width=100)
+    txt_min_mgo = ft.TextField(label="Min %MgO", value="8.0", width=100)
+    txt_max_caf2 = ft.TextField(label="Max %CaF2", value="5.0", width=100)
+    txt_temp = ft.TextField(label="Temp (°C)", value="1600", width=100)
 
-    def remove_material_row(row_instance):
-        material_rows_col.controls.remove(row_instance)
-        material_rows_col.update()
-
-    # -------------------------------------------------------------------------
-    # Input Section: Carry-over Slag & Constraints
-    # -------------------------------------------------------------------------
-
-    # Carry-over Inputs
-    txt_carry_mass = ft.TextField(label="Mass (kg)", value="1000", width=100)
-
-    carry_inputs = {}
-    oxides = ["FeO", "CaO", "MgO", "SiO2", "Al2O3", "MnO"]
-    carry_defaults = {"FeO": 15, "CaO": 30, "MgO": 8, "SiO2": 30, "Al2O3": 10, "MnO": 7}
-
-    carry_inputs_row = [txt_carry_mass]
-    for oxide in oxides:
-        tf = ft.TextField(label=f"%{oxide}", value=str(carry_defaults[oxide]), width=80)
-        carry_inputs[oxide] = tf
-        carry_inputs_row.append(tf)
-
-    section_carry_over = ft.Container(
-        content=ft.Column(
-            [
-                ft.Text(
-                    "Carry-over Slag Parameters", size=16, weight=ft.FontWeight.BOLD
-                ),
-                ft.Row(carry_inputs_row, wrap=True),
-            ]
-        ),
-        padding=10,
-        border=ft.Border.all(1, ft.Colors.WHITE24),
-        border_radius=8,
-    )
-
-    # Targets
-    txt_target_b2 = ft.TextField(label="Target B2 (CaO/SiO2)", value="2.0", width=150)
-    txt_target_mgo = ft.TextField(label="Min %MgO", value="10.0", width=150)
-
-    section_targets = ft.Container(
-        content=ft.Column(
-            [
-                ft.Text("Optimization Targets", size=16, weight=ft.FontWeight.BOLD),
-                ft.Row([txt_target_b2, txt_target_mgo]),
-            ]
-        ),
-        padding=10,
-        border=ft.Border.all(1, ft.Colors.WHITE24),
-        border_radius=8,
+    tab_process = ft.Tab(
+        text="1. Proceso & Inicio",
+        content=ft.Column([
+            ft.Container(
+                content=ft.Column([
+                    ft.Text("Desoxidación del Acero (Cálculo de Inclusiones)", size=16, weight="bold", color=ft.colors.BLUE_200),
+                    ft.Row([txt_steel_mass, txt_O_ppm]),
+                    ft.Row([txt_Al_add, txt_FeSi_add, txt_FeMn_add]),
+                    ft.Text("Nota: Se asume Al 100%, FeSi 75%, FeMn 80%. El oxígeno se consume en orden: Al -> Si -> Mn", size=12, italic=True)
+                ]), padding=10, border=ft.Border.all(1, ft.colors.WHITE24), border_radius=10
+            ),
+            ft.Container(
+                content=ft.Column([
+                    ft.Text("Escoria Carry-Over (Remanente del Horno)", size=16, weight="bold", color=ft.colors.ORANGE_200),
+                    ft.Row([txt_carry_mass]),
+                    ft.Row(list(inputs_carry.values()), wrap=True)
+                ]), padding=10, border=ft.Border.all(1, ft.colors.WHITE24), border_radius=10
+            ),
+            ft.Container(
+                content=ft.Column([
+                    ft.Text("Objetivos de Optimización", size=16, weight="bold", color=ft.colors.GREEN_200),
+                    ft.Row([txt_target_b2, txt_min_mgo, txt_max_caf2, txt_temp])
+                ]), padding=10, border=ft.Border.all(1, ft.colors.WHITE24), border_radius=10
+            )
+        ], scroll=ft.ScrollMode.AUTO)
     )
 
     # -------------------------------------------------------------------------
-    # Materials Section
+    # TAB 2: MATERIALES (Carga)
     # -------------------------------------------------------------------------
+    
+    col_materials = ft.Column(scroll=ft.ScrollMode.ALWAYS, height=400)
+    switch_cost = ft.Switch(label="Optimizar por Costo ($)", value=False)
 
-    # Pre-populate some defaults
-    def populate_defaults(e):
-        # Clear existing
-        material_rows_col.controls.clear()
-        add_material_row(name="Lime", defaults={"CaO": 95, "MgO": 1, "SiO2": 1})
-        add_material_row(name="Dolo", defaults={"CaO": 58, "MgO": 38, "SiO2": 1})
+    class MaterialRow(ft.Container):
+        def __init__(self, remove_func, index, defaults=None):
+            super().__init__()
+            self.remove_func = remove_func
+            self.inputs = {}
+            
+            self.txt_name = ft.TextField(value=f"Mat {index+1}", width=100, label="Nombre", height=40, text_size=12)
+            self.txt_price = ft.TextField(value="0.1", width=60, label="$/kg", height=40, text_size=12)
+            
+            row_ctrls = [self.txt_name, self.txt_price]
+            chem = defaults if defaults else {}
+            
+            for ox in oxides:
+                val = str(chem.get(ox, 0.0))
+                tf = ft.TextField(value=val, label=ox, width=60, height=40, text_size=12, content_padding=5)
+                self.inputs[ox] = tf
+                row_ctrls.append(tf)
+            
+            row_ctrls.append(ft.IconButton(icon=ft.icons.DELETE, icon_color="red", on_click=lambda _: self.remove_func(self)))
+            
+            self.content = ft.Row(row_ctrls, spacing=5, alignment=ft.MainAxisAlignment.START)
+
+        def get_data(self):
+            try:
+                chem = np.array([float(self.inputs[ox].value) for ox in oxides])
+                price = float(self.txt_price.value)
+                return {"name": self.txt_name.value, "chem": chem, "price": price}
+            except: return None
+
+    def add_material(e=None, defaults=None):
+        row = MaterialRow(lambda r: (material_rows.remove(r), col_materials.controls.remove(r), page.update()), len(material_rows), defaults)
+        material_rows.append(row)
+        col_materials.controls.append(row)
         page.update()
 
-    btn_add_mat = ft.FilledButton(
-        content=ft.Text("Add Material"), icon="add", on_click=add_material_row
-    )
-    btn_reset_defaults = ft.TextButton(
-        content=ft.Text("Load Defaults"), on_click=populate_defaults
-    )
+    # Botones Materiales
+    btn_add = ft.FilledButton("Agregar Material", icon=ft.icons.ADD, on_click=lambda _: add_material())
+    
+    # Cargar defaults
+    add_material(defaults={"CaO":90}) # Cal
+    add_material(defaults={"CaO":55, "MgO":35}) # Dolomita
+    add_material(defaults={"CaF2":85, "SiO2":10}) # Espato
 
-    section_materials = ft.Container(
-        content=ft.Column(
-            [
-                ft.Row(
-                    [
-                        ft.Text(
-                            "Available Materials", size=16, weight=ft.FontWeight.BOLD
-                        ),
-                        ft.VerticalDivider(width=20),
-                        btn_add_mat,
-                        btn_reset_defaults,
-                    ],
-                    alignment=ft.MainAxisAlignment.START,
-                ),
-                ft.Divider(),
-                # Fixed height container for list to avoid rendering bugs
-                ft.Container(
-                    content=material_rows_col,
-                    height=300,  # Fixed height as requested
-                    border=ft.Border.all(1, ft.Colors.WHITE10),
-                    border_radius=4,
-                    padding=5,
-                ),
-            ]
-        ),
-        padding=10,
-        border=ft.Border.all(1, ft.Colors.WHITE24),
-        border_radius=8,
-        margin=ft.Margin(top=10, bottom=10),
+    tab_materials = ft.Tab(
+        text="2. Carga & Materiales",
+        content=ft.Column([
+            ft.Row([ft.Text("Lista de Aditivos", size=16, weight="bold"), switch_cost]),
+            ft.Row([btn_add]),
+            ft.Container(content=col_materials, border=ft.Border.all(1, ft.colors.WHITE10), border_radius=5, padding=5)
+        ])
     )
 
     # -------------------------------------------------------------------------
-    # Results Section
+    # TAB 3: RESULTADOS
     # -------------------------------------------------------------------------
+    
+    txt_status = ft.Text("Esperando cálculo...")
+    results_container = ft.Column()
+    img_plot = ft.Image(src_base64="", width=500, height=400, fit=ft.ImageFit.CONTAIN)
 
-    txt_result_status = ft.Text("Ready", color=ft.Colors.GREY_400)
-
-    # Grid for results
-    results_grid = ft.Column()
-
-    section_results = ft.Container(
-        content=ft.Column(
-            [
-                ft.Text("Optimization Results", size=16, weight=ft.FontWeight.BOLD),
-                txt_result_status,
-                ft.Divider(),
-                results_grid,
-            ]
-        ),
-        padding=10,
-        border=ft.Border.all(1, ft.Colors.WHITE24),
-        border_radius=8,
-        visible=False,
-    )
-
-    # -------------------------------------------------------------------------
-    # Logic Handling
-    # -------------------------------------------------------------------------
-
-    def run_optimization(e):
+    def solve(e):
+        txt_status.value = "Calculando..."
+        page.update()
+        
         try:
-            # 1. Parse Carry Over
-            c_mass = float(txt_carry_mass.value)
-            c_chem = {
-                ox: float(input_tf.value) for ox, input_tf in carry_inputs.items()
-            }
+            # 1. LOGICA DE DESOXIDACIÓN
+            # -------------------------
+            steel_ton = float(txt_steel_mass.value)
+            O_ppm_in = float(txt_O_ppm.value)
+            
+            # Kg de O total a remover (asumiendo todo reacciona para simplificar)
+            kg_O_total = steel_ton * 1000 * (O_ppm_in / 1e6)
+            
+            kg_Al = float(txt_Al_add.value)
+            kg_Si = float(txt_FeSi_add.value) * 0.75 # Grado FeSi
+            kg_Mn = float(txt_FeMn_add.value) * 0.80 # Grado FeMn
 
-            # 2. Parse Targets
+            # Consumo de O por Al (2 Al + 3 O -> Al2O3) | Rel Mass: 54 Al consume 48 O (Ratio 0.888)
+            # O mejor: 1 kg Al consume 0.89 kg O.
+            O_consumed_Al = min(kg_O_total, kg_Al * (48/54))
+            kg_Al2O3_gen = O_consumed_Al * (102/48)
+            O_rem = kg_O_total - O_consumed_Al
+            
+            # Consumo por Si (Si + 2 O -> SiO2) | 28 Si consume 32 O (Ratio 1.14)
+            O_consumed_Si = 0.0
+            kg_SiO2_gen = 0.0
+            if O_rem > 0:
+                O_consumed_Si = min(O_rem, kg_Si * (32/28))
+                kg_SiO2_gen = O_consumed_Si * (60/32)
+                O_rem -= O_consumed_Si
+            
+            # Consumo por Mn (Mn + O -> MnO) | 55 Mn consume 16 O
+            kg_MnO_gen = 0.0
+            if O_rem > 0:
+                O_consumed_Mn = min(O_rem, kg_Mn * (16/55))
+                kg_MnO_gen = O_consumed_Mn * (71/16)
+
+            # 2. PREPARAR SOLVER
+            # ------------------
+            # Masa base = Carry Over + Productos Desoxidación
+            m_carry = float(txt_carry_mass.value)
+            # Vector base: ["FeO", "CaO", "MgO", "SiO2", "Al2O3", "MnO", "CaF2"]
+            base_chem = np.array([float(inputs_carry[ox].value) for ox in oxides])
+            
+            # Masa de cada oxido en carry over
+            base_masses = (base_chem / 100.0) * m_carry
+            
+            # Sumar oxidos de desoxidación
+            # SiO2 (idx 3), Al2O3 (idx 4), MnO (idx 5)
+            base_masses[3] += kg_SiO2_gen
+            base_masses[4] += kg_Al2O3_gen
+            base_masses[5] += kg_MnO_gen
+            
+            total_base_mass = np.sum(base_masses)
+            
+            # Datos Materiales
+            mats_data = [row.get_data() for row in material_rows if row.get_data()]
+            if not mats_data: raise ValueError("No hay materiales")
+            
+            comps_matrix = np.array([m["chem"] for m in mats_data]).T # (7, N)
+            prices = np.array([m["price"] for m in mats_data])
+            
+            # Targets
             t_b2 = float(txt_target_b2.value)
-            t_mgo = float(txt_target_mgo.value)
+            t_mgo = float(txt_min_mgo.value)
+            t_caf2_max = float(txt_max_caf2.value)
 
-            # 3. Parse Materials
-            mats = []
-            for ctrl in material_rows_col.controls:
-                if isinstance(ctrl, MaterialRow):
-                    data = ctrl.get_data()
-                    if data:
-                        mats.append(data)
+            # 3. EJECUTAR SOLVER (SCIPY)
+            # --------------------------
+            n_vars = len(mats_data)
+            
+            def mass_balance(x):
+                added_mass_oxides = np.dot(comps_matrix, x)
+                final_mass_oxides = base_masses + added_mass_oxides
+                total_mass = np.sum(final_mass_oxides)
+                return total_mass, final_mass_oxides
 
-            if not mats:
-                page.snack_bar = ft.SnackBar(
-                    ft.Text("Please add at least one material")
-                )
-                page.snack_bar.open = True
-                page.update()
+            def objective(x):
+                if switch_cost.value: return np.sum(x * prices)
+                return np.sum(x)
+
+            # Constraints
+            def cons_b2(x):
+                _, oxs = mass_balance(x)
+                # CaO(1) / SiO2(3)
+                if oxs[3] < 0.1: return 0.0
+                return (oxs[1]/oxs[3]) - t_b2
+            
+            def cons_mgo(x): # MgO(2)
+                tot, oxs = mass_balance(x)
+                return (oxs[2]/tot*100) - t_mgo
+
+            def cons_caf2(x): # CaF2(6) <= Max
+                tot, oxs = mass_balance(x)
+                return t_caf2_max - (oxs[6]/tot*100)
+
+            res = minimize(objective, np.full(n_vars, 10.0), bounds=[(0, None)]*n_vars, 
+                           constraints=[{'type':'ineq', 'fun':cons_b2}, {'type':'ineq', 'fun':cons_mgo}, {'type':'ineq', 'fun':cons_caf2}], method='SLSQP')
+
+            if not res.success:
+                txt_status.value = f"Error en optimización: {res.message}"
+                txt_status.color = "red"
                 return
 
-            # 4. Run Solver
-            res = solve_optimization(c_mass, c_chem, mats, t_b2, t_mgo)
+            # 4. POST-PROCESO
+            # ---------------
+            final_tot, final_oxs_kg = mass_balance(res.x)
+            final_chem = (final_oxs_kg / final_tot) * 100
+            final_dict = {ox: val for ox, val in zip(oxides, final_chem)}
 
-            # 5. Display Results
-            section_results.visible = True
+            # Calcular Viscosidad Urbain
+            temp_c = float(txt_temp.value)
+            urbain_res = urbain_modified(final_dict, [temp_c])
+            visc_val = urbain_res.mu_Pa_s[0] if urbain_res else 0.0
+            
+            # Calcular % Líquido (CSV)
+            liq_pct = phase_model.predict_liquid(final_dict["Al2O3"], final_dict["SiO2"])
 
-            if res["success"]:
-                txt_result_status.value = f"Optimization Successful: {res['message']}"
-                txt_result_status.color = ft.Colors.GREEN_400
-            else:
-                txt_result_status.value = f"Optimization Failed: {res['message']}"
-                txt_result_status.color = ft.Colors.RED_400
-
-            # Formating Output
-
-            # Recipe Table
-            recipe_rows = [
-                ft.DataRow(
-                    cells=[
-                        ft.DataCell(ft.Text(name)),
-                        ft.DataCell(
-                            ft.Text(f"{mass:.2f} kg", weight=ft.FontWeight.BOLD)
-                        ),
-                    ]
-                )
-                for name, mass in res["added_masses"].items()
-                if mass > 0.01  # Show only significant additions
-            ]
-
-            recipe_table = ft.DataTable(
-                columns=[
-                    ft.DataColumn(ft.Text("Material")),
-                    ft.DataColumn(ft.Text("Mass to Add")),
-                ],
-                rows=recipe_rows,
-                border=ft.border.all(1, ft.Colors.WHITE24),
-            )
-
-            # Final Chemistry Columns
-            chem_rows = [
-                ft.DataRow(
-                    cells=[
-                        ft.DataCell(ft.Text(ox)),
-                        ft.DataCell(ft.Text(f"{pct:.2f} %")),
-                    ]
-                )
-                for ox, pct in res["final_chem"].items()
-            ]
-
-            # Add Targets to chem table for comparison
-            target_summary = f"Targets -> B2: {res['final_b2']:.2f} (Min {t_b2}), %MgO: {res['final_chem']['MgO']:.2f}% (Min {t_mgo})"
-
-            chem_table = ft.DataTable(
-                columns=[
-                    ft.DataColumn(ft.Text("Oxide")),
-                    ft.DataColumn(ft.Text("Final %")),
-                ],
-                rows=chem_rows,
-                border=ft.border.all(1, ft.Colors.WHITE24),
-            )
-
-            # Update Grid
-            results_grid.controls = [
-                ft.Text(f"Total Final Mass: {res['final_mass']:.2f} kg", size=14),
-                ft.Container(height=10),
-                ft.Text("Recipe (Additions):", weight=ft.FontWeight.BOLD),
-                recipe_table,
-                ft.Container(height=20),
-                ft.Text("Final Chemistry:", weight=ft.FontWeight.BOLD),
-                ft.Text(target_summary, color=ft.Colors.CYAN_200),
-                chem_table,
-                ft.Container(height=20),
-                ft.Divider(),
-                ft.Text(
-                    "Slag Properties (Thermo-Calc Data)",
-                    size=16,
-                    weight=ft.FontWeight.BOLD,
-                ),
-                ft.Container(height=10),
-            ]
-
-            # --- Slag Properties Prediction ---
+            # 5. GRAFICAR (TERNARIO + MAPA DE CALOR)
+            # -------------------------------------
             try:
-                slag_model = SlagProperties("slag_data.csv")
-                b2_calc = res["final_b2"]
-                al2o3_calc = res["final_chem"].get("Al2O3", 0.0)
+                plt.figure(figsize=(5, 4))
+                
+                # Coordenadas Ternarias (Normalizadas para plot)
+                # Ejes: Izq=CaO, Der=SiO2, Arr=Al2O3
+                # X = 0.5 * (2*SiO2 + Al2O3) / Total
+                # Y = (sqrt(3)/2) * Al2O3 / Total
+                
+                # Datos de fondo (CSV)
+                if phase_model.raw_data is not None:
+                    # Normalizar datos CSV para ternario
+                    df = phase_model.raw_data
+                    # Asumimos que CaO es el resto aprox para pintar el triángulo
+                    # Solo pintamos los puntos disponibles
+                    sums = df.iloc[:,0] + df.iloc[:,1] + (100 - df.iloc[:,0] - df.iloc[:,1]) # Dummy sum
+                    
+                    # SiO2 (col 1), Al2O3 (col 0)
+                    # Ojo: tu csv tiene Alumina col 0, Silica col 1
+                    al_v = df.iloc[:,0].values
+                    si_v = df.iloc[:,1].values
+                    liq_v = df.iloc[:,2].values
+                    
+                    # Transformar a ternario
+                    # Normalizamos localmente a 100 para la proyección
+                    # (Asumiendo que el csv es balance CaO)
+                    tot_v = 100.0 
+                    x_v = 0.5 * (2 * si_v + al_v) / tot_v
+                    y_v = (np.sqrt(3)/2) * al_v / tot_v
+                    
+                    # Mapa de Calor
+                    plt.tricontourf(x_v, y_v, liq_v, levels=20, cmap='inferno')
+                    plt.colorbar(label="Ratio Líquido (0-1)")
 
-                visc, liq_frac = slag_model.predict(b2_calc, al2o3_calc)
+                # Triángulo Marco
+                plt.plot([0, 1, 0.5, 0], [0, 0, np.sqrt(3)/2, 0], 'k-', lw=2)
+                plt.text(-0.05, -0.05, 'CaO', weight='bold')
+                plt.text(1.02, -0.05, 'SiO2', weight='bold')
+                plt.text(0.48, 0.9, 'Al2O3', weight='bold')
+                
+                # Punto Final Escoria
+                # Normalizar solo ternario para ploteo
+                tern_sum = final_dict["CaO"] + final_dict["SiO2"] + final_dict["Al2O3"]
+                if tern_sum > 0:
+                    f_al = final_dict["Al2O3"] * (100/tern_sum)
+                    f_si = final_dict["SiO2"] * (100/tern_sum)
+                    px = 0.5 * (2 * f_si + f_al) / 100
+                    py = (np.sqrt(3)/2) * f_al / 100
+                    plt.plot(px, py, 'o', color='lime', markeredgecolor='black', markersize=10, label='Tu Escoria')
+                    plt.legend(loc='upper right')
 
-                # Viscosity Display Logic
-                visc_color = ft.Colors.GREEN_400
-                visc_text = "Fluid"
-                if visc > 5.0:
-                    visc_color = ft.Colors.RED_400
-                    visc_text = "Viscous"
-                elif visc > 3.0:
-                    visc_color = ft.Colors.ORANGE_400
-                    visc_text = "Semi-Fluid"
-
-                visc_control = ft.Container(
-                    content=ft.Column(
-                        [
-                            ft.Text("Viscosity", size=12, color=ft.Colors.GREY_400),
-                            ft.Row(
-                                [
-                                    ft.Icon(ft.Icons.WATER_DROP, color=visc_color),
-                                    ft.Text(
-                                        f"{visc:.2f} Poise",
-                                        size=20,
-                                        weight=ft.FontWeight.BOLD,
-                                        color=visc_color,
-                                    ),
-                                    ft.Text(f"({visc_text})", color=visc_color),
-                                ]
-                            ),
-                        ]
-                    ),
-                    padding=10,
-                    border=ft.Border.all(1, ft.Colors.WHITE10),
-                    border_radius=8,
-                )
-
-                # Liquid Fraction Display Logic
-                liq_color = ft.Colors.GREEN_400
-                if liq_frac < 90:
-                    liq_color = (
-                        ft.Colors.RED_400 if liq_frac < 80 else ft.Colors.ORANGE_400
-                    )
-
-                liq_control = ft.Container(
-                    content=ft.Column(
-                        [
-                            ft.Row(
-                                [
-                                    ft.Text(
-                                        "Liquid Fraction",
-                                        size=12,
-                                        color=ft.Colors.GREY_400,
-                                    ),
-                                    ft.Text(
-                                        f"{liq_frac:.1f}%",
-                                        weight=ft.FontWeight.BOLD,
-                                        color=liq_color,
-                                    ),
-                                ],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            ),
-                            ft.ProgressBar(
-                                value=liq_frac / 100.0,
-                                color=liq_color,
-                                bgcolor=ft.Colors.GREY_800,
-                                height=10,
-                            ),
-                        ]
-                    ),
-                    padding=10,
-                    border=ft.Border.all(1, ft.Colors.WHITE10),
-                    border_radius=8,
-                    margin=ft.Margin(top=5, bottom=0),
-                )
-
-                results_grid.controls.extend([visc_control, liq_control])
+                plt.axis('off')
+                plt.title(f"Proyección Ternaria (Fondo: Datos Thermo-Calc)")
+                
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png', bbox_inches='tight', transparent=True)
+                plt.close()
+                buf.seek(0)
+                img_plot.src_base64 = base64.b64encode(buf.read()).decode('utf-8')
+                img_plot.update()
 
             except Exception as e:
-                results_grid.controls.append(
-                    ft.Text(
-                        f"Property Prediction Error: {str(e)}", color=ft.Colors.RED_400
-                    )
-                )
+                print(f"Plot Error: {e}")
 
+            # 6. MOSTRAR RESULTADOS TEXTO
+            # ---------------------------
+            rows_recipe = []
+            for i, val in enumerate(res.x):
+                if val > 0.1:
+                    rows_recipe.append(ft.DataRow([ft.DataCell(ft.Text(mats_data[i]["name"])), ft.DataCell(ft.Text(f"{val:.1f}"))]))
+
+            rows_chem = [ft.DataRow([ft.DataCell(ft.Text(ox)), ft.DataCell(ft.Text(f"{final_dict[ox]:.2f}"))]) for ox in oxides]
+            
+            txt_status.value = "Cálculo Exitoso"
+            txt_status.color = "green"
+            
+            # KPI Cards
+            kpi_visc = ft.Container(content=ft.Column([
+                ft.Text("Viscosidad (Urbain)", size=12), 
+                ft.Text(f"{visc_val:.2f} Pa·s", size=20, weight="bold", color="cyan")
+            ]), padding=10, bgcolor=ft.colors.BLACK45, border_radius=5)
+            
+            kpi_liq = ft.Container(content=ft.Column([
+                ft.Text("Fase Líquida (CSV)", size=12), 
+                ft.Text(f"{liq_pct:.1f} %", size=20, weight="bold", color="orange" if liq_pct < 100 else "green")
+            ]), padding=10, bgcolor=ft.colors.BLACK45, border_radius=5)
+            
+            results_container.controls = [
+                ft.Row([kpi_visc, kpi_liq]),
+                ft.Divider(),
+                ft.Row([
+                    ft.DataTable(columns=[ft.DataColumn(ft.Text("Material")), ft.DataColumn(ft.Text("Kg Add"))], rows=rows_recipe),
+                    ft.DataTable(columns=[ft.DataColumn(ft.Text("Oxido")), ft.DataColumn(ft.Text("% Final"))], rows=rows_chem)
+                ], alignment=ft.MainAxisAlignment.SPACE_EVENLY),
+                ft.Text(f"Productos Desoxidación: Al2O3={kg_Al2O3_gen:.1f}kg, SiO2={kg_SiO2_gen:.1f}kg, MnO={kg_MnO_gen:.1f}kg", italic=True)
+            ]
             page.update()
 
-        except ValueError as ex:
-            page.snack_bar = ft.SnackBar(ft.Text(f"Input Error: {str(ex)}"))
-            page.snack_bar.open = True
-            page.update()
         except Exception as ex:
-            page.snack_bar = ft.SnackBar(ft.Text(f"Error: {str(ex)}"))
-            page.snack_bar.open = True
+            txt_status.value = f"Error Crítico: {ex}"
+            txt_status.color = "red"
             page.update()
 
-    btn_calc = ft.FilledButton(
-        content=ft.Text("Calculate Optimization"),
-        icon="calculate",
-        on_click=run_optimization,
-        height=50,
-        style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
-    )
+    btn_calc = ft.FilledButton("CALCULAR OPTIMIZACIÓN", on_click=solve, height=50)
 
-    # -------------------------------------------------------------------------
-    # Layout Assembly
-    # -------------------------------------------------------------------------
-
-    page.add(
-        ft.Text(
-            "Steelmaking Slag Balance",
-            size=24,
-            weight=ft.FontWeight.BOLD,
-            color=ft.Colors.BLUE_200,
-        ),
+    # LAYOUT FINAL
+    tab_results = ft.Tab(text="3. Resultados & Análisis", content=ft.Column([
+        txt_status,
+        btn_calc,
         ft.Divider(),
-        section_carry_over,
-        section_targets,
-        section_materials,
-        ft.Divider(),
-        ft.Row([btn_calc], alignment=ft.MainAxisAlignment.CENTER),
-        ft.Container(height=20),
-        section_results,
-    )
+        ft.Row([results_container, img_plot], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, vertical_alignment=ft.CrossAxisAlignment.START)
+    ], scroll=ft.ScrollMode.AUTO))
 
-    # Initialize with formatted defaults
-    populate_defaults(None)
-
+    tabs.tabs = [tab_process, tab_materials, tab_results]
+    page.add(tabs)
 
 if __name__ == "__main__":
     ft.app(target=main)
-
-# -----------------------------------------------------------------------------
-# PyInstaller Command
-# -----------------------------------------------------------------------------
-# To compile this script into a standalone windowed application:
-# pyinstaller --noconfirm --onefile --windowed --name "SlagOptimizer" balance_escoria.py
