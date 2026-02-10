@@ -12,6 +12,33 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import io
 import base64
+import os
+import sys
+
+# =============================================================================
+# 0. UTILIDADES Y GESTIÓN DE RUTAS (PARA EXE)
+# =============================================================================
+
+
+def resource_path(relative_path):
+    """Obtiene la ruta absoluta al recurso, funciona para dev y para PyInstaller"""
+    try:
+        # PyInstaller crea una carpeta temporal en _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+
+def safe_float(val):
+    try:
+        if not val:
+            return 0.0
+        return float(val)
+    except:
+        return 0.0
+
 
 # =============================================================================
 # 1. MODELO DE VISCOSIDAD DE URBAIN
@@ -159,10 +186,12 @@ class SlagPhaseModel:
 
     def load_models(self):
         # Load Base Model (No CaF2)
-        self.models["base"] = self._load_from_csv("liquid_ratio_cleaned.csv", "Base")
+        self.models["base"] = self._load_from_csv(
+            resource_path("liquid_ratio_cleaned.csv"), "Base"
+        )
         # Load Fluidized Model (5% CaF2)
         self.models["caf2"] = self._load_from_csv(
-            "liquid_ratio_cleaned_5CaF2.csv", "5% CaF2"
+            resource_path("liquid_ratio_cleaned_5CaF2.csv"), "5% CaF2"
         )
 
     def _load_from_csv(self, path, name):
