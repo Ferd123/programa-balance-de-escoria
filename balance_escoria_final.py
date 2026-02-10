@@ -99,7 +99,7 @@ def urbain_modified(
     wt_in: Dict[str, float], T_C: Sequence[float]
 ) -> Optional[UrbainResult]:
     try:
-        wt_norm = normalize_wt_percent(wt_in)9+
+        wt_norm = normalize_wt_percent(wt_in)
         X = wt_to_mole_fractions(wt_norm)
         XG = X["SiO2"] + X["P2O5"]
         XA = X["Al2O3"] + X["Fe2O3"]
@@ -250,14 +250,47 @@ def main(page: ft.Page):
     txt_FeSi_add = ft.TextField(
         label="FeSi (kg)",
         value="50",
-        width=100,
+        width=90,
         filled=False,
         border_color=ft.Colors.WHITE38,
     )
+    txt_FeSi_grade = ft.TextField(
+        label="%Si",
+        value="75",
+        width=60,
+        filled=False,
+        border_color=ft.Colors.WHITE38,
+    )
+
     txt_FeMn_add = ft.TextField(
         label="FeMn (kg)",
         value="100",
+        width=90,
+        filled=False,
+        border_color=ft.Colors.WHITE38,
+    )
+    txt_FeMn_grade = ft.TextField(
+        label="%Mn",
+        value="80",
+        width=60,
+        filled=False,
+        border_color=ft.Colors.WHITE38,
+    )
+
+    # Parametros de Ajuste (Calibración)
+    txt_gamma = ft.TextField(
+        label="Gamma (Reduc. Carry)",
+        value="0.5",
+        width=120,
+        tooltip="Fracción de FeO/MnO del carry-over que reacciona",
+        filled=False,
+        border_color=ft.Colors.WHITE38,
+    )
+    txt_fcap = ft.TextField(
+        label="Efic. Captura",
+        value="0.8",
         width=100,
+        tooltip="Fracción de inclusiones atrapadas en escoria",
         filled=False,
         border_color=ft.Colors.WHITE38,
     )
@@ -332,9 +365,29 @@ def main(page: ft.Page):
             ft.Container(
                 content=ft.Column(
                     [
-                        ft.Text("1. Desoxidación", weight="bold", color="blue200"),
-                        ft.Row([txt_steel_mass, txt_O_ppm]),
-                        ft.Row([txt_Al_add, txt_FeSi_add, txt_FeMn_add]),
+                        ft.Text(
+                            "1. Desoxidación & Inclusiones (Realista)",
+                            weight="bold",
+                            color="blue200",
+                        ),
+                        ft.Row([txt_steel_mass, txt_O_ppm, txt_gamma, txt_fcap]),
+                        ft.Row(
+                            [
+                                txt_Al_add,
+                                ft.VerticalDivider(),
+                                txt_FeSi_add,
+                                txt_FeSi_grade,
+                                ft.VerticalDivider(),
+                                txt_FeMn_add,
+                                txt_FeMn_grade,
+                            ]
+                        ),
+                        ft.Text(
+                            "Nota: Considera O disuelto + O reducible del Carry-Over (Gamma). Prioridad: Al > Si > Mn",
+                            size=11,
+                            italic=True,
+                            color="grey",
+                        ),
                     ]
                 ),
                 padding=15,
@@ -529,26 +582,30 @@ def main(page: ft.Page):
             M_steel = float(txt_steel_mass.value) * 1000
             ppm_O = float(txt_O_ppm.value)
             kg_O_dissolved = M_steel * (ppm_O / 1e6)
-            
-            gamma = float(txt_gamma.value) # Factor reducción carry-over
+
+            gamma = float(txt_gamma.value)  # Factor reducción carry-over
             f_cap = float(txt_fcap.value)  # Factor captura inclusiones
-            
+
             # Aleaciones disponibles
             kg_Al = float(txt_Al_add.value)
-            kg_Si = float(txt_FeSi_add.value) * (float(txt_FeSi_grade.value)/100.0)
-            kg_Mn = float(txt_FeMn_add.value) * (float(txt_FeMn_grade.value)/100.0)
+            kg_Si = float(txt_FeSi_add.value) * (float(txt_FeSi_grade.value) / 100.0)
+            kg_Mn = float(txt_FeMn_add.value) * (float(txt_FeMn_grade.value) / 100.0)
             # 2. CÁLCULO OXÍGENO POTENCIAL DEL CARRY-OVER
             M_carry = float(txt_carry_mass.value)
             # Vector Carry Inicial [FeO, CaO, MgO, SiO2, Al2O3, MnO, CaF2]
-            vec_carry_initial = np.array([float(inputs_carry[ox].value) for ox in oxides]) * M_carry / 100.0
-            
+            vec_carry_initial = (
+                np.array([float(inputs_carry[ox].value) for ox in oxides])
+                * M_carry
+                / 100.0
+            )
+
             # Oxígeno en FeO (MW O / MW FeO = 16/71.84 = 0.2227)
-            O_from_FeO = vec_carry_initial[0] * (MW["O"]/MW["FeO"])
+            O_from_FeO = vec_carry_initial[0] * (MW["O"] / MW["FeO"])
             # Oxígeno en MnO (MW O / MW MnO = 16/70.94 = 0.2255)
-            O_from_MnO = vec_carry_initial[5] * (MW["O"]/MW["MnO"])
-            
+            O_from_MnO = vec_carry_initial[5] * (MW["O"] / MW["MnO"])
+
             O_reducible_carry = (O_from_FeO + O_from_MnO) * gamma
-            
+
             # 3. LÓGICA DE DESOXIDACIÓN (Priority: Al > Si > Mn)
             O_total_demand = kg_O_dissolved + O_reducible_carry
             O_rem = O_total_demand
@@ -558,7 +615,7 @@ def main(page: ft.Page):
             O_consumed_Al = min(O_rem, cap_O_Al)
             gen_Al2O3 = O_consumed_Al * (101.96 / 48.0)
             O_rem -= O_consumed_Al
-            
+
             # -- Paso B: Silicio --
             cap_O_Si = kg_Si * (32.0 / 28.09)
             O_consumed_Si = 0.0
@@ -567,7 +624,7 @@ def main(page: ft.Page):
                 O_consumed_Si = min(O_rem, cap_O_Si)
                 gen_SiO2 = O_consumed_Si * (60.08 / 32.0)
                 O_rem -= O_consumed_Si
-            
+
             # -- Paso C: Manganeso --
             cap_O_Mn = kg_Mn * (16.0 / 54.94)
             O_consumed_Mn = 0.0
@@ -579,22 +636,48 @@ def main(page: ft.Page):
             # 2. Balance Setup (Strict Immutability)
             m_carry = float(txt_carry_mass.value)
 
-            # Vector 1: Carry-Over (Purely from inputs)
-            vec_carry = (
-                np.array([float(inputs_carry[ox].value) for ox in oxides])
-                * m_carry
-                / 100
+            # 4. BALANCE DE MASA DE LA REACCIÓN
+            # ¿Cuánto O vino del Slag vs Acero?
+            O_consumed_total = O_consumed_Al + O_consumed_Si + O_consumed_Mn
+            O_taken_from_slag = max(0.0, O_consumed_total - kg_O_dissolved)
+
+            # Repartimos la "pérdida" de O proporcionalmente entre FeO y MnO disponibles
+            ratio_red = 0.0
+            if O_reducible_carry > 0:
+                ratio_red = O_taken_from_slag / O_reducible_carry
+
+            mass_FeO_lost = (vec_carry_initial[0] * gamma) * ratio_red
+            mass_MnO_lost = (vec_carry_initial[5] * gamma) * ratio_red
+
+            # Vector de cambio por reacción (Deltas)
+            # [FeO, CaO, MgO, SiO2, Al2O3, MnO, CaF2]
+            vec_reaction_delta = np.zeros(7)
+            vec_reaction_delta[0] = -mass_FeO_lost  # Se pierde FeO
+            vec_reaction_delta[5] = -mass_MnO_lost  # Se pierde MnO
+
+            # Sumamos lo generado (aplicando eficiencia de captura)
+            vec_reaction_delta[3] += gen_SiO2 * f_cap  # SiO2
+            vec_reaction_delta[4] += gen_Al2O3 * f_cap  # Al2O3
+            vec_reaction_delta[5] += gen_MnO * f_cap  # MnO (Neto possible)
+
+            # BASE PARA EL SOLVER (Carry + Reacción)
+            # Use vec_carry_initial instead of creating vec_carry again
+            vec_carry = vec_carry_initial
+            vec_deox = (
+                vec_reaction_delta  # Now contains both generation (+) and reduction (-)
             )
 
-            # Vector 2: Deoxidation Products (Purely from Deox step)
-            vec_deox = np.zeros(7)
-            vec_deox[3] = kg_SiO2  # SiO2
-            vec_deox[4] = kg_Al2O3  # Al2O3
-            vec_deox[5] = kg_MnO  # MnO
+            # Base for Optimization
+            base_optim = vec_carry + vec_deox
+            # Ensure no negatives for solver stability
+            base_optim = np.maximum(base_optim, 0.0)
+
+            # OLD CODE BYPASS
+            if False:
+                vec_deox = np.zeros(7)
 
             # Base for Optimization (Sum of Carry + Deox)
             # This is the starting point for the solver, but we keep components separate for display.
-            base_optim = vec_carry + vec_deox
 
             mats = [r.get_data() for r in material_rows if r.get_data()]
             if not mats:
@@ -882,7 +965,14 @@ def main(page: ft.Page):
                                 ft.Text(f"{vec_carry[i]:.1f}", color=ft.Colors.GREY_400)
                             ),
                             ft.DataCell(
-                                ft.Text(f"{vec_deox[i]:.1f}", color=ft.Colors.BLUE_200)
+                                ft.Text(
+                                    f"{vec_deox[i]:.1f}",
+                                    color=(
+                                        ft.Colors.BLUE_200
+                                        if vec_deox[i] >= 0
+                                        else ft.Colors.RED_200
+                                    ),
+                                )
                             ),
                             ft.DataCell(
                                 ft.Text(f"{vec_adds[i]:.1f}", color=ft.Colors.GREEN_200)
