@@ -231,6 +231,12 @@ def main(page: ft.Page):
     phase_model = SlagPhaseModel()
     material_rows = []
 
+    # --- HELPER: SANITIZE INPUT ---
+    def sanitize_input(e):
+        if not e.control.value:
+            e.control.value = "0"
+            e.control.update()
+
     # --- PESTAÑA 1: PROCESO ---
     txt_steel_mass = ft.TextField(
         label="Masa Acero (Ton)",
@@ -238,6 +244,7 @@ def main(page: ft.Page):
         width=120,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_O_ppm = ft.TextField(
         label="O disuelto (ppm)",
@@ -245,6 +252,7 @@ def main(page: ft.Page):
         width=120,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_Al_add = ft.TextField(
         label="Al (kg)",
@@ -252,6 +260,7 @@ def main(page: ft.Page):
         width=100,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_FeSi_add = ft.TextField(
         label="FeSi (kg)",
@@ -259,6 +268,7 @@ def main(page: ft.Page):
         width=90,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_FeSi_grade = ft.TextField(
         label="%Si",
@@ -266,6 +276,7 @@ def main(page: ft.Page):
         width=60,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
 
     txt_FeMn_add = ft.TextField(
@@ -274,6 +285,7 @@ def main(page: ft.Page):
         width=90,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_FeMn_grade = ft.TextField(
         label="%Mn",
@@ -281,6 +293,7 @@ def main(page: ft.Page):
         width=60,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
 
     # Parametros de Ajuste (Calibración)
@@ -291,6 +304,7 @@ def main(page: ft.Page):
         tooltip="Fracción de FeO/MnO del carry-over que reacciona",
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_fcap = ft.TextField(
         label="Efic. Captura",
@@ -299,6 +313,7 @@ def main(page: ft.Page):
         tooltip="Fracción de inclusiones atrapadas en escoria",
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
 
     txt_carry_mass = ft.TextField(
@@ -307,6 +322,7 @@ def main(page: ft.Page):
         width=140,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     oxides = ["FeO", "CaO", "MgO", "SiO2", "Al2O3", "MnO", "CaF2"]
     carry_defaults = {
@@ -326,6 +342,7 @@ def main(page: ft.Page):
             text_size=12,
             filled=False,
             border_color=ft.Colors.WHITE38,
+            on_blur=sanitize_input,
         )
         for ox in oxides
     }
@@ -336,6 +353,7 @@ def main(page: ft.Page):
         width=100,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_min_mgo = ft.TextField(
         label="Min %MgO",
@@ -343,6 +361,7 @@ def main(page: ft.Page):
         width=100,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_max_caf2 = ft.TextField(
         label="Max %CaF2",
@@ -350,6 +369,7 @@ def main(page: ft.Page):
         width=100,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_temp = ft.TextField(
         label="Temp (°C)",
@@ -357,6 +377,7 @@ def main(page: ft.Page):
         width=100,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_min_mass = ft.TextField(
         label="Min Masa (kg)",
@@ -364,6 +385,7 @@ def main(page: ft.Page):
         width=100,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
     txt_min_liquid = ft.TextField(
         label="Min % Líquido",
@@ -371,6 +393,7 @@ def main(page: ft.Page):
         width=100,
         filled=False,
         border_color=ft.Colors.WHITE38,
+        on_blur=sanitize_input,
     )
 
     # --- TARGET MODES ---
@@ -382,6 +405,7 @@ def main(page: ft.Page):
             text_size=12,
             filled=False,
             border_color="green200",
+            on_blur=sanitize_input,
         )
         for ox in oxides
     }
@@ -522,7 +546,11 @@ def main(page: ft.Page):
                 value=default_name, width=100, label="Nombre", **style
             )
             self.txt_price = ft.TextField(
-                value=str(price), label="$/kg", width=70, **style
+                value=str(price),
+                label="$/kg",
+                width=70,
+                **style,
+                on_blur=sanitize_input,
             )
 
             self.inputs = {}
@@ -537,6 +565,7 @@ def main(page: ft.Page):
                     width=65,
                     **style,
                     on_change=lambda e: self.update_total(),
+                    on_blur=sanitize_input,
                 )
                 self.inputs[ox] = tf
                 row_ctrls.append(tf)
