@@ -689,7 +689,7 @@ def main(page: ft.Page):
             if not mats:
                 raise ValueError("Sin materiales")
 
-            comps = np.array([m["chem"] for m in mats]).T
+            comps = np.array([m["chem"] for m in mats]).T / 100.0
             costs = np.array([m["price"] for m in mats])
 
             # Constraints Targets
@@ -699,7 +699,8 @@ def main(page: ft.Page):
             t_mass = float(txt_min_mass.value)
 
             # --- OPTIMIZATION CORE ---
-            def run_optimization(max_caf2_constraint):
+            # --- OPTIMIZATION CORE ---
+            def run_optimization(min_caf2_constraint, max_caf2_constraint):
                 # Local Objective Function
                 def f_obj(x):
                     return np.sum(x * costs) if switch_cost.value else np.sum(x)
@@ -710,10 +711,13 @@ def main(page: ft.Page):
                     vec_adds_temp = np.dot(comps, x)
                     fin = base_optim + vec_adds_temp
                     tot = np.sum(fin)
+                    if tot == 0:
+                        return [-1] * 5
                     return [
                         (fin[1] / fin[3]) - t_b2,  # B2 >= Target
                         (fin[2] / tot * 100) - t_mgo,  # MgO >= Target
-                        max_caf2_constraint - (fin[6] / tot * 100),  # CaF2 <= Limit
+                        max_caf2_constraint - (fin[6] / tot * 100),  # CaF2 <= Max Limit
+                        (fin[6] / tot * 100) - min_caf2_constraint,  # CaF2 >= Min Limit
                         tot - t_mass,  # Mass >= Target
                     ]
 
@@ -726,6 +730,7 @@ def main(page: ft.Page):
                         {"type": "ineq", "fun": lambda x: constr(x)[1]},
                         {"type": "ineq", "fun": lambda x: constr(x)[2]},
                         {"type": "ineq", "fun": lambda x: constr(x)[3]},
+                        {"type": "ineq", "fun": lambda x: constr(x)[4]},
                     ],
                     method="SLSQP",
                 )
@@ -748,7 +753,7 @@ def main(page: ft.Page):
             active_model_name = "economy"
             limit_pass1 = min(0.5, t_caf2_limit)  # Enforce 0.5% max for economy
 
-            res, d_fin = run_optimization(limit_pass1)
+            res, d_fin = run_optimization(0.0, limit_pass1)
 
             # Check Quality using Base Model
             model_active, _, _, _ = phase_model.get_model("economy")
@@ -759,17 +764,18 @@ def main(page: ft.Page):
                 )
 
             # PASS 2: Fluidized Mode (If Pass 1 failed or slag too viscous)
-            # Condition: (No Solution OR Liquid < 90%) AND User permits CaF2 > 0.5
-            need_fluidizer = res is None or liquid_pct < 90.0
+            # Condition: (No Solution OR Liquid < 85%) AND User permits CaF2 > 0.5
+            need_fluidizer = res is None or liquid_pct < 85.0
             can_add_fluorspar = t_caf2_limit > 0.5
 
             if need_fluidizer and can_add_fluorspar:
-                # Retry with full user limit
-                res2, d_fin2 = run_optimization(t_caf2_limit)
+                # Retry with FORCE MIN 3% CaF2, Max 8%
+                # This ensures the slag actually has CaF2 to match the diagram
+                res2, d_fin2 = run_optimization(3.0, 8.0)
 
                 if res2 is not None:
                     # Switch to Fluidized Strategy
-                    strategy_used = "Fluidized (5% CaF2)"
+                    strategy_used = "Fluidized (Min 3% CaF2)"
                     active_model_name = "fluidized"
                     model_active, _, _, _ = phase_model.get_model("fluidized")
                     liq2 = phase_model.predict_liquid(
