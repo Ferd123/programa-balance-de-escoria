@@ -365,6 +365,69 @@ def main(page: ft.Page):
         filled=False,
         border_color=ft.Colors.WHITE38,
     )
+    txt_min_liquid = ft.TextField(
+        label="Min % Líquido",
+        value="60",
+        width=100,
+        filled=False,
+        border_color=ft.Colors.WHITE38,
+    )
+
+    # --- TARGET MODES ---
+    inputs_target = {
+        ox: ft.TextField(
+            label=f"Target %{ox}",
+            value="0.0",
+            width=80,
+            text_size=12,
+            filled=False,
+            border_color="green200",
+        )
+        for ox in oxides
+    }
+
+    # Defaults for targets
+    # (Optional: set defaults if needed, e.g. from carry)
+
+    col_constraints = ft.Column(
+        [
+            ft.Row(
+                [
+                    txt_target_b2,
+                    txt_min_mgo,
+                    txt_max_caf2,
+                    txt_min_liquid,
+                ],
+                wrap=True,
+            ),
+        ]
+    )
+
+    col_targets_exact = ft.Column(
+        [
+            ft.Text("Objetivo Exacto (Química):", size=12, color="green200"),
+            ft.Row(list(inputs_target.values()), wrap=True),
+        ],
+        visible=False,
+    )
+
+    def toggle_mode(e):
+        is_exact = e.data == "exact"
+        col_constraints.visible = not is_exact
+        col_targets_exact.visible = is_exact
+        col_constraints.update()
+        col_targets_exact.update()
+
+    mode_selector = ft.RadioGroup(
+        content=ft.Row(
+            [
+                ft.Radio(value="constraints", label="Restricciones (B2, MgO)"),
+                ft.Radio(value="exact", label="Objetivo Exacto"),
+            ]
+        ),
+        value="constraints",
+        on_change=toggle_mode,
+    )
 
     content_process = ft.Column(
         [
@@ -417,17 +480,14 @@ def main(page: ft.Page):
             ft.Container(
                 content=ft.Column(
                     [
-                        ft.Text("3. Targets", weight="bold", color="green200"),
-                        ft.Row(
-                            [
-                                txt_target_b2,
-                                txt_min_mgo,
-                                txt_max_caf2,
-                                txt_temp,
-                                txt_min_mass,
-                            ],
-                            wrap=True,
+                        ft.Text(
+                            "3. Targets / Estrategia", weight="bold", color="green200"
                         ),
+                        mode_selector,
+                        ft.Divider(),
+                        ft.Row([txt_min_mass, txt_temp]),  # Siempre visible
+                        col_constraints,
+                        col_targets_exact,
                     ]
                 ),
                 padding=15,
@@ -697,14 +757,20 @@ def main(page: ft.Page):
             t_mgo = float(txt_min_mgo.value)
             t_caf2_limit = float(txt_max_caf2.value)
             t_mass = float(txt_min_mass.value)
+            t_liq = float(txt_min_liquid.value)
 
             # --- OPTIMIZATION CORE ---
             # --- OPTIMIZATION CORE ---
-            def run_optimization(min_caf2_constraint, max_caf2_constraint):
+            def run_optimization(min_caf2_constraint, max_caf2_constraint, model_name):
+                # Retrieve the correct phase model for this pass
+                # get_model returns: (model, df_ternary, ternary_max, sys_name)
+                model_active, _, _, _ = phase_model.get_model(model_name)
+
                 # Local Objective Function
                 def f_obj(x):
                     return np.sum(x * costs) if switch_cost.value else np.sum(x)
 
+                # Local Constraints
                 # Local Constraints
                 def constr(x):
                     # Current Total Mass = Base + Additions
@@ -712,13 +778,24 @@ def main(page: ft.Page):
                     fin = base_optim + vec_adds_temp
                     tot = np.sum(fin)
                     if tot == 0:
-                        return [-1] * 5
+                        return [-1] * 6
+
+                    # Calculate Percentages for Liquid Prediction
+                    pct_si = fin[3] / tot * 100
+                    pct_al = fin[4] / tot * 100
+
+                    # Predict Liquid Fraction
+                    current_liq = phase_model.predict_liquid(
+                        pct_al, pct_si, model_active
+                    )
+
                     return [
                         (fin[1] / fin[3]) - t_b2,  # B2 >= Target
                         (fin[2] / tot * 100) - t_mgo,  # MgO >= Target
                         max_caf2_constraint - (fin[6] / tot * 100),  # CaF2 <= Max Limit
                         (fin[6] / tot * 100) - min_caf2_constraint,  # CaF2 >= Min Limit
                         tot - t_mass,  # Mass >= Target
+                        current_liq - t_liq,  # Liquid >= Target
                     ]
 
                 res_opt = minimize(
@@ -731,6 +808,7 @@ def main(page: ft.Page):
                         {"type": "ineq", "fun": lambda x: constr(x)[2]},
                         {"type": "ineq", "fun": lambda x: constr(x)[3]},
                         {"type": "ineq", "fun": lambda x: constr(x)[4]},
+                        {"type": "ineq", "fun": lambda x: constr(x)[5]},
                     ],
                     method="SLSQP",
                 )
@@ -746,46 +824,119 @@ def main(page: ft.Page):
 
                 return res_opt, d_fin_calc
 
-            # --- SMART SOLVER LOOP (2-Pass) ---
+            # --- STRATEGY SELECTION ---
+            mode = mode_selector.value
 
-            # PASS 1: Economy Mode (Strict CaF2 limit)
-            strategy_used = "Economy (Base)"
-            active_model_name = "economy"
-            limit_pass1 = min(0.5, t_caf2_limit)  # Enforce 0.5% max for economy
+            if mode == "exact":
+                # --- EXACT TARGET MODE (QUÍMICA) ---
+                strategy_used = "Objetivo Exacto"
+                active_model_name = "economy"  # Default until check CaF2
 
-            res, d_fin = run_optimization(0.0, limit_pass1)
+                # Parse Targets
+                vec_target = np.array([float(inputs_target[ox].value) for ox in oxides])
 
-            # Check Quality using Base Model
-            model_active, _, _, _ = phase_model.get_model("economy")
-            liquid_pct = 0.0
-            if res is not None:
-                liquid_pct = phase_model.predict_liquid(
-                    d_fin["Al2O3"], d_fin["SiO2"], model_active
+                def f_obj_exact(x):
+                    vec_adds = np.dot(comps, x)
+                    fin = base_optim + vec_adds
+                    tot = np.sum(fin)
+                    if tot == 0:
+                        return 1e9
+
+                    fin_pct = fin / tot * 100
+                    diff = fin_pct - vec_target
+                    error = np.sum(diff**2)
+
+                    # Small regularization cost?
+                    cost_term = 0.0
+                    if switch_cost.value:
+                        cost_term = np.sum(x * costs) * 1e-4
+
+                    return error + cost_term
+
+                def constr_mass(x):
+                    vec_adds = np.dot(comps, x)
+                    fin = base_optim + vec_adds
+                    tot = np.sum(fin)
+                    return tot - t_mass
+
+                res = minimize(
+                    f_obj_exact,
+                    np.full(len(mats), 10.0),
+                    bounds=[(0, None)] * len(mats),
+                    constraints=[{"type": "ineq", "fun": constr_mass}],
+                    method="SLSQP",
                 )
 
-            # PASS 2: Fluidized Mode (If Pass 1 failed or slag too viscous)
-            # Condition: (No Solution OR Liquid < 85%) AND User permits CaF2 > 0.5
-            need_fluidizer = res is None or liquid_pct < 85.0
-            can_add_fluorspar = t_caf2_limit > 0.5
+                if res.success:
+                    vec_adds_final = np.dot(comps, res.x)
+                    final_kg_calc = base_optim + vec_adds_final
+                    final_pct_calc = final_kg_calc / np.sum(final_kg_calc) * 100
+                    d_fin = {ox: v for ox, v in zip(oxides, final_pct_calc)}
 
-            if need_fluidizer and can_add_fluorspar:
-                # Retry with FORCE MIN 3% CaF2, Max 8%
-                # This ensures the slag actually has CaF2 to match the diagram
-                res2, d_fin2 = run_optimization(3.0, 8.0)
+                    # Check Deviation
+                    dev_abs = np.mean(np.abs(final_pct_calc - vec_target))
+                    if dev_abs > 0.5:
+                        strategy_used += f" (Dev: {dev_abs:.1f}%)"
 
-                if res2 is not None:
-                    # Switch to Fluidized Strategy
-                    strategy_used = "Fluidized (Min 3% CaF2)"
-                    active_model_name = "fluidized"
-                    model_active, _, _, _ = phase_model.get_model("fluidized")
-                    liq2 = phase_model.predict_liquid(
-                        d_fin2["Al2O3"], d_fin2["SiO2"], model_active
+                    # Select Model for Plotting
+                    if d_fin["CaF2"] > 2.0:
+                        active_model_name = "fluidized"
+                    else:
+                        active_model_name = "economy"
+
+                    model_active, _, _, _ = phase_model.get_model(active_model_name)
+                    liquid_pct = phase_model.predict_liquid(
+                        d_fin["Al2O3"], d_fin["SiO2"], model_active
+                    )
+                else:
+                    res = None
+                    d_fin = None
+                    liquid_pct = 0.0
+
+            else:
+                # --- CONSTRAINTS MODE (Original 2-Pass) ---
+
+                # PASS 1: Economy Mode (Strict CaF2 limit)
+                strategy_used = "Economy (Base)"
+                active_model_name = "economy"
+                limit_pass1 = min(0.5, t_caf2_limit)  # Enforce 0.5% max for economy
+
+                # Try to solve with Economy constraints (including Liquid >= Target)
+                res, d_fin = run_optimization(0.0, limit_pass1, "economy")
+
+                # Check Quality using Base Model
+                model_active, _, _, _ = phase_model.get_model("economy")
+                liquid_pct = 0.0
+                if res is not None:
+                    liquid_pct = phase_model.predict_liquid(
+                        d_fin["Al2O3"], d_fin["SiO2"], model_active
                     )
 
-                    # Accept Pass 2 results
-                    res = res2
-                    d_fin = d_fin2
-                    liquid_pct = liq2
+                # PASS 2: Fluidized Mode (If Pass 1 failed or slag too viscous)
+                # Condition: (No Solution OR Liquid < Target) AND User permits CaF2 > 0.5
+                # Note: The solver *should* fail if liquid < Target in Pass 1, returning res=None.
+                # But we double check liquid_pct just in case constraint tolerance allowed slightly less.
+                need_fluidizer = res is None or liquid_pct < t_liq
+                can_add_fluorspar = t_caf2_limit > 0.5
+
+                if need_fluidizer and can_add_fluorspar:
+                    # Retry with FORCE MIN 3% CaF2, Max 8%
+                    # This ensures the slag actually has CaF2 to match the diagram
+                    res2, d_fin2 = run_optimization(3.0, 8.0, "fluidized")
+
+                    if res2 is not None:
+                        # Switch to Fluidized Strategy
+                        strategy_used = "Fluidized (Min 3% CaF2)"
+                        active_model_name = "fluidized"
+                        model_active, _, _, _ = phase_model.get_model("fluidized")
+                        liq2 = phase_model.predict_liquid(
+                            d_fin2["Al2O3"], d_fin2["SiO2"], model_active
+                        )
+
+                        # Accept Pass 2 results
+                        res = res2
+                        d_fin = d_fin2
+                        liquid_pct = liq2
 
             if res is None:
                 raise ValueError("No se encontró solución factible (Infeasible)")
